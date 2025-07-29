@@ -4,6 +4,8 @@ from tqdm import tqdm
 
 from PIL import Image
 
+import gc
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -15,10 +17,10 @@ from diffusers import (
     UniPCMultistepScheduler
 )
 
-# from peft import (
-#     LoraConfig,
-#     get_peft_model
-# )
+from peft import (
+     LoraConfig,
+     get_peft_model
+)
 
 # from accelerate import Accelerator
 
@@ -26,6 +28,8 @@ from loss import *
 
 
 def train(config, writer, train_loader):
+    torch.cuda.empty_cache()
+
     # Get config
     # fsdp_plugin = FSDPPlugin(sharing_strategy="FULL_SHARD")
     # accelerator = Accelerator(mixed_precision="fp16")
@@ -56,21 +60,26 @@ def train(config, writer, train_loader):
         torch_dtype=torch.float16
         ).to(device)
     
-    # peft_config = LoraConfig(
-    #     r=2,
-    #     lora_alpha=8,
-    #     lora_dropout=0.1,
-    #     bias="none",
-    #     task_type="INPAINT",
-    #     target_modules=[
-    #         "mid_block.attn2.to_q",
-    #         "mid_block.attn2.to_v",
-    #         ]
-    #     )
-    # pipe.unet = get_peft_model(pipe.unet, peft_config)
+    # for name, module in pipe.unet.named_modules():
+    #     print(name)
+    
+    peft_config = LoraConfig(
+        r=2,
+        lora_alpha=8,
+        lora_dropout=0.1,
+        bias="none",
+        task_type="INPAINT",
+        target_modules=[
+            "mid_block.attentions.0.transformer_blocks.0.attn1.to_q",
+            "mid_block.attentions.0.transformer_blocks.0.attn2.to_q",
+            ]
+        )
+    
+    pipe.unet.enable_gradient_checkpointing()
+    pipe.unet = get_peft_model(pipe.unet, peft_config)
 
-    pipe.enable_model_cpu_offload()
-    pipe.enable_attention_slicing(slice_size="auto")
+    #pipe.enable_model_cpu_offload()
+    #pipe.enable_attention_slicing(slice_size="auto")
 
     # Set mode
     unet = pipe.unet.train()
@@ -157,9 +166,6 @@ def train(config, writer, train_loader):
             )
             noise_pred = out.sample # backward possible
 
-            #noise_pred.sum().backward() #okay
-            #print("noise")
-
             # Denoise
             # out = scheduler.step(
             #     model_output=noise_pred,   
@@ -170,29 +176,15 @@ def train(config, writer, train_loader):
 
             # pred_x0 = out.pred_original_sample  # Tensor [B, C, h, w]
 
-            #noise_pred.sum().backward() okay
-            #print("noise")
-
             alphas = scheduler.alphas_cumprod.to(device)
             alpha_t = alphas[timesteps].view(-1,1,1,1)
             beta_t = 1 - alpha_t
             pred_x0 = (noisy_latents - beta_t.sqrt() * noise_pred) / alpha_t.sqrt()
             pred_x0 = pred_x0.half()
 
-            #noise_pred.sum().backward()
-            #print("noise")
-
             decoded = vae.decode(pred_x0 / pipe.vae.config.scaling_factor).sample
-
-            noise_pred.sum().backward()
-            print("noise")
-
             decode_image = (decoded / 2 + 0.5).clamp(0, 1).to(device)  # [B,3,H,W] in [0,1]
 
-            noise_pred.sum().backward()
-            print("noise")
-
-            
             # Debug (Inverse)
             # img_np = decode_image.detach().cpu().permute(0, 2, 3, 1).numpy()
             # img_np = (img_np * 255).round().astype("uint8") 
@@ -200,22 +192,7 @@ def train(config, writer, train_loader):
             # img_pil[0].save(f"{output_path}/{folder_name}/{epoch}_{names[0]} (decoded image).png")
             
             # Loss
-            noise_pred.sum().backward()
-            print("noise")
-
             loss_mse = F.mse_loss(noise_pred * mask_latent, noise * mask_latent)
-
-            noise_pred.sum().backward()
-            print("noise")
-
-            mask_latent.sum().backward()
-            print("mask")
-
-            (noise_pred * mask_latent).sum().backward()
-            print("pred")
-            
-            loss_mse.backward()
-            print("mse")
 
             ret = [criterion(f'train/{n}', out) for n, out in zip(names, decode_image)]
             # loss_pcd = torch.stack(ret).mean()
@@ -223,8 +200,7 @@ def train(config, writer, train_loader):
             loss_dir = torch.stack([l[1] for l in ret]).mean()
             loss_con = torch.stack([l[2] for l in ret]).mean()
 
-            loss = loss_mse + loss_pcd
-            loss = loss.to(device)
+            loss = loss_mse #+ loss_pcd
             losses = {
                 "MSE": loss_mse.item(),
                 "PCD": loss_pcd.item(),
@@ -246,6 +222,18 @@ def train(config, writer, train_loader):
             # accelerator.backward(loss)
             loss.backward()
             optimizer.step()
+
+            gc.collect()
+            torch.cuda.empty_cache()
+            gc.collect()
+
+            del ret, loss_mse, loss_con, loss_dir, losses
+            del origin_latents, masked_img, masked_latents, mask_latent, latent_input
+            del noise, timesteps, noisy_latents
+            del down_res, mid_res, out, noise_pred
+            del pred_x0, decoded, decode_image
+
+            continue
 
             # Save
             if epoch == 1 or (epoch + 1) % save_every == 0:
